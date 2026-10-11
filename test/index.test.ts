@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process"
 import { describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -5,29 +6,68 @@ import { join } from "node:path"
 
 import autoMode from "../src/index.ts"
 
-type MockState = {
-  promptCalls: number
-  reviewerRequests: string[]
-  permissionResponses: string[]
+type ReviewerSession = {
+  id: string
+  messages: unknown[]
+  created: Record<string, unknown>
 }
 
-function makeShell(outputs: string[] = []) {
-  return (() => {
-    const hasOutput = outputs.length > 0
-    const output = outputs.shift() ?? ""
-    const promise = Promise.resolve({
-      exitCode: hasOutput ? 0 : 1,
-      text: () => output,
-    }) as Promise<{ exitCode: number; text(): string }> & {
-      cwd(path: string): unknown
-      quiet(): unknown
-      nothrow(): unknown
-    }
-    promise.cwd = () => promise
-    promise.quiet = () => promise
-    promise.nothrow = () => promise
-    return promise
-  }) as never
+type MockState = {
+  promptCalls: number
+  hangReview: boolean
+  pendingTurns: string[]
+  reviewerRequests: string[]
+  reviewerCreates: Array<Record<string, unknown>>
+  replies: Array<{ sessionID: string; requestID: string; decision: string; message?: string }>
+  removedSessions: string[]
+  interruptedSessions: string[]
+}
+
+type Hooks = {
+  transformCallbacks: Array<(editor: unknown) => void>
+  toolHooks: Record<string, (input: unknown) => Promise<void> | void>
+  permissionHooks: Record<string, (input: unknown) => Promise<void> | void>
+  pushEvent: (event: unknown) => void
+  agents: Map<string, Record<string, unknown>>
+  editor: {
+    list(): Array<Record<string, unknown>>
+    update(id: string, fn: (agent: Record<string, unknown>) => void): void
+  }
+}
+
+function makeEventSource() {
+  const queue: unknown[] = []
+  let waiting: (() => void) | null = null
+  let closed = false
+  return {
+    push(event: unknown) {
+      queue.push(event)
+      if (waiting) {
+        const wake = waiting
+        waiting = null
+        wake()
+      }
+    },
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<unknown>> {
+          return new Promise((resolve) => {
+            const check = () => {
+              const value = queue.shift()
+              if (value !== undefined) resolve({ value, done: false })
+              else if (closed) resolve({ value: undefined, done: true })
+              else waiting = check
+            }
+            check()
+          })
+        },
+        return() {
+          closed = true
+          return Promise.resolve({ value: undefined, done: true })
+        },
+      }
+    },
+  }
 }
 
 async function makeHooks(
@@ -36,119 +76,259 @@ async function makeHooks(
   directory = "/workspace/project",
   priorCommands: string[] = [],
   assistantMessages: string[] = [],
-  gitOutputs: string[] = [],
+  existingAgents: Record<string, Record<string, unknown>> = {},
+  options: Record<string, unknown> = { enabled: true, model: "openai/test-model" },
 ) {
-  const state: MockState = { promptCalls: 0, reviewerRequests: [], permissionResponses: [] }
-  const client = {
-    app: {
-      log: async () => ({ data: true }),
-    },
-    tui: {
-      showToast: async () => ({ data: true }),
-    },
-    session: {
-      messages: async () => ({
-        data: [
-          ...userMessages.map((text, index) => ({
-            info: { id: `user-${index}`, role: "user" },
-            parts: [{ type: "text", text }],
-          })),
-          ...assistantMessages.map((text, index) => ({
-            info: { id: `assistant-text-${index}`, role: "assistant" },
-            parts: [{ type: "text", text }],
-          })),
-          ...priorCommands.map((command, index) => ({
-            info: { id: `assistant-${index}`, role: "assistant" },
-            parts: [
-              {
-                type: "tool",
-                tool: "bash",
-                callID: `prior-call-${index}`,
-                state: { input: { command } },
-              },
-            ],
-          })),
-        ],
-      }),
-      create: async () => ({ data: { id: "review-session" } }),
-      prompt: async (request: { body?: { parts?: Array<{ text?: string }> } }) => {
-        state.promptCalls += 1
-        state.reviewerRequests.push(request.body?.parts?.[0]?.text ?? "")
-        return {
-          data: {
-            parts: [{ type: "text", text: reviewerText }],
-          },
-        }
-      },
-      abort: async () => ({ data: true }),
-      delete: async () => ({ data: true }),
-    },
-    postSessionIdPermissionsPermissionId: async (request: { body?: { response?: string } }) => {
-      state.permissionResponses.push(request.body?.response ?? "")
-      return { data: true }
+  const state: MockState = {
+    promptCalls: 0,
+    hangReview: false,
+    pendingTurns: [],
+    reviewerRequests: [],
+    reviewerCreates: [],
+    replies: [],
+    removedSessions: [],
+    interruptedSessions: [],
+  }
+  const hooks: Hooks = {
+    transformCallbacks: [],
+    toolHooks: {},
+    permissionHooks: {},
+    pushEvent: () => {},
+    agents: new Map(),
+    editor: {
+      list: () => [],
+      update: () => {},
     },
   }
-  const hooks = await autoMode(
-    {
-      client,
-      directory,
-      worktree: directory,
-      project: { id: "project" },
-      serverUrl: new URL("http://localhost:4096"),
-      $: makeShell(gitOutputs),
-    } as never,
-    { enabled: true, model: "openai/test-model" },
-  )
-  return { hooks, state }
+
+  for (const [id, agent] of Object.entries(existingAgents)) {
+    hooks.agents.set(id, { id, ...agent })
+  }
+
+  // Seed the session under review with v2-shaped messages.
+  const now = Date.now()
+  const seedMessages = [
+    ...userMessages.map((text, index) => ({ id: `user-${index}`, type: "user", text, time: { created: now } })),
+    ...priorCommands.map((command, index) => ({
+      id: `prior-${index}`,
+      type: "assistant",
+      agent: "main",
+      model: { id: "session-model", providerID: "session-provider" },
+      content: [
+        {
+          type: "tool",
+          id: `prior-call-${index}`,
+          name: "bash",
+          state: { status: "completed", input: { command } },
+          time: { created: now },
+        },
+      ],
+      time: { created: now },
+    })),
+    ...assistantMessages.map((text, index) => ({
+      id: `assistant-${index}`,
+      type: "assistant",
+      agent: "main",
+      model: { id: "session-model", providerID: "session-provider" },
+      content: [{ type: "text", text }],
+      time: { created: now },
+    })),
+  ]
+  const sessions = new Map<string, ReviewerSession>()
+  sessions.set("session", { id: "session", messages: seedMessages, created: {} })
+
+  const eventSource = makeEventSource()
+  hooks.pushEvent = (event: unknown) => eventSource.push(event)
+
+  hooks.editor = {
+    list: () => [...hooks.agents.values()],
+    update: (id: string, fn: (agent: Record<string, unknown>) => void) => {
+      const agent = hooks.agents.get(id) ?? { id }
+      hooks.agents.set(id, agent)
+      fn(agent)
+    },
+  }
+
+  const context = {
+    app: { name: "opencode", version: "2.0.0", channel: "dev" },
+    location: { directory },
+    options,
+    agent: {
+      transform: async (callback: (editor: unknown) => void) => {
+        hooks.transformCallbacks.push(callback)
+        callback(hooks.editor)
+        return { dispose: async () => {} }
+      },
+      list: async () => [...hooks.agents.values()],
+      get: async (id: string) => hooks.agents.get(id),
+      reload: async () => {},
+    },
+    tool: {
+      hook: async (name: string, callback: (input: unknown) => Promise<void> | void) => {
+        hooks.toolHooks[name] = callback
+        return { dispose: async () => {} }
+      },
+    },
+    permission: {
+      hook: async (name: string, callback: (input: unknown) => Promise<void> | void) => {
+        hooks.permissionHooks[name] = callback
+        return { dispose: async () => {} }
+      },
+      reply: async (input: { sessionID: string; requestID: string; decision: string; message?: string }) => {
+        state.replies.push(input)
+      },
+    },
+    session: {
+      create: async (input: Record<string, unknown>) => {
+        const id = `reviewer-${state.reviewerCreates.length + 1}`
+        state.reviewerCreates.push(input)
+        sessions.set(id, { id, messages: [], created: input })
+        return { id }
+      },
+      prompt: async (input: { sessionID: string; text: string }) => {
+        const session = sessions.get(input.sessionID)
+        if (!session) throw new Error(`Unknown reviewer session: ${input.sessionID}`)
+        state.promptCalls += 1
+        state.reviewerRequests.push(input.text)
+        session.messages.push({ id: `user-${session.messages.length}`, type: "user", text: input.text, time: { created: Date.now() } })
+        if (!state.hangReview) {
+          // Scripted turns (state.pendingTurns) replace the default reviewer
+          // text; the first scripted turn answers this prompt and the rest
+          // are delivered by wait(), as the harness would continue the
+          // reviewer's agent loop after a denied tool call.
+          const text = state.pendingTurns.length > 0 ? (state.pendingTurns.shift() as string) : reviewerText
+          session.messages.push({
+            id: `assistant-${session.messages.length}`,
+            type: "assistant",
+            agent: "auto-reviewer",
+            model: { id: "test-model", providerID: "openai" },
+            content: [{ type: "text", text }],
+            time: { created: Date.now() },
+          })
+        }
+        return { id: "inbox" }
+      },
+      wait: async (input: { sessionID: string }) => {
+        const session = sessions.get(input.sessionID)
+        if (session && !state.hangReview && state.pendingTurns.length > 0) {
+          const text = state.pendingTurns.shift() as string
+          session.messages.push({
+            id: `assistant-${session.messages.length}`,
+            type: "assistant",
+            agent: "auto-reviewer",
+            model: { id: "test-model", providerID: "openai" },
+            content: [{ type: "text", text }],
+            time: { created: Date.now() },
+          })
+        }
+      },
+      context: async (input: { sessionID: string }) => sessions.get(input.sessionID)?.messages ?? [],
+      interrupt: async (input: { sessionID: string }) => {
+        state.interruptedSessions.push(input.sessionID)
+      },
+      remove: async (input: { sessionID: string }) => {
+        state.removedSessions.push(input.sessionID)
+        sessions.delete(input.sessionID)
+      },
+      get: async () => ({ id: "session" }),
+    },
+    event: {
+      subscribe: (_options: { signal?: AbortSignal }) => eventSource,
+    },
+  }
+
+  await autoMode.setup(context as never)
+  return { hooks, state, sessions }
 }
 
-async function executeBefore(
-  hooks: Awaited<ReturnType<typeof autoMode>>,
-  tool: string,
-  args: Record<string, unknown>,
-) {
-  const hook = hooks["tool.execute.before"]
+async function executeBefore(hooks: Hooks, tool: string, args: Record<string, unknown>) {
+  const hook = hooks.toolHooks["execute.before"]
   if (!hook) throw new Error("tool.execute.before hook is missing")
-  return hook({ tool, sessionID: "session", callID: "call" }, { args })
+  return hook({ tool, sessionID: "session", agent: "main", messageID: "message", id: "call", input: args })
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 5_000) {
+  const start = Date.now()
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) throw new Error("Timed out waiting for mock state")
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
+async function git(directory: string, args: string[]) {
+  await new Promise<void>((resolve, reject) => {
+    execFile("git", args, { cwd: directory }, (error) => (error ? reject(error) : resolve()))
+  })
 }
 
 describe("configuration", () => {
+  test("exposes the v2 plugin definition", () => {
+    expect(autoMode.id).toBe("auto-reviewer")
+    expect(typeof autoMode.setup).toBe("function")
+  })
+
   test("replaces native asks while preserving explicit denies", async () => {
-    const { hooks } = await makeHooks()
-    const config = {
-      permission: {
-        "*": "ask",
-        edit: { "*": "ask", locked: "deny" },
+    const { hooks } = await makeHooks(undefined, [], "/workspace/project", [], [], {
+      custom: {
+        name: "custom",
+        permissions: [
+          { action: "bash", resource: "*", effect: "ask" },
+          { action: "edit", resource: "*", effect: "deny" },
+        ],
       },
-      agent: {
-        custom: {
-          permission: { bash: "ask", edit: "deny" },
-        },
-      },
-    } as never
-
-    await hooks.config?.(config)
-
-    expect(config).toMatchObject({
-      permission: {
-        "*": "allow",
-        edit: { "*": "allow", locked: "deny" },
-      },
-      agent: {
-        custom: {
-          permission: { "*": "allow", bash: "allow", edit: "deny" },
-        },
-        "auto-reviewer": {
-          hidden: true,
-          permission: { "*": "deny" },
-          model: "openai/test-model",
-        },
-      },
+      plain: { name: "plain" },
     })
-    const reviewer = (config as unknown as { agent: Record<string, { prompt: string }> }).agent["auto-reviewer"]
-    expect(reviewer?.prompt).toContain("Later explicit revocations")
-    expect(reviewer?.prompt).toContain("lockfile alone is not evidence of trust")
-    expect(reviewer?.prompt).toContain("Never infer external scope from a development workflow")
+
+    const custom = hooks.agents.get("custom")
+    expect(custom?.permissions).toEqual([
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "bash", resource: "*", effect: "allow" },
+      { action: "edit", resource: "*", effect: "deny" },
+    ])
+    expect(hooks.agents.get("plain")?.permissions).toEqual([{ action: "*", resource: "*", effect: "allow" }])
+
+    const reviewer = hooks.agents.get("auto-reviewer")
+    expect(reviewer?.hidden).toBe(true)
+    expect(reviewer?.mode).toBe("subagent")
+    expect(reviewer?.steps).toBe(3)
+    expect(reviewer?.permissions).toEqual([{ action: "*", resource: "*", effect: "deny" }])
+    expect(reviewer?.model).toEqual({ id: "test-model", providerID: "openai" })
+    const system = String(reviewer?.system ?? "")
+    expect(system).toContain("Later explicit revocations")
+    expect(system).toContain("lockfile alone is not evidence of trust")
+    expect(system).toContain("Never infer external scope from a development workflow")
+  })
+
+  test("does not duplicate the allow default on transform replay", async () => {
+    const { hooks } = await makeHooks()
+    expect(hooks.transformCallbacks).toHaveLength(1)
+    hooks.transformCallbacks[0]?.(hooks.editor)
+    expect(hooks.agents.get("auto-reviewer")?.permissions).toEqual([{ action: "*", resource: "*", effect: "deny" }])
+  })
+
+  test("disables the plugin when enabled is false", async () => {
+    const { hooks } = await makeHooks(undefined, [], "/workspace/project", [], [], {}, { enabled: false })
+    expect(hooks.toolHooks).toEqual({})
+    expect(hooks.permissionHooks).toEqual({})
+    expect(hooks.transformCallbacks).toHaveLength(0)
+  })
+
+  test("rejects a non-boolean enabled option", async () => {
+    await expect(
+      makeHooks(undefined, [], "/workspace/project", [], [], {}, { enabled: "yes" }),
+    ).rejects.toThrow(TypeError)
+  })
+
+  test("rejects a non-string model option", async () => {
+    await expect(
+      makeHooks(undefined, [], "/workspace/project", [], [], {}, { enabled: true, model: 42 }),
+    ).rejects.toThrow(TypeError)
+  })
+
+  test("rejects an unparseable model option", async () => {
+    await expect(
+      makeHooks(undefined, [], "/workspace/project", [], [], {}, { enabled: true, model: "no-slash" }),
+    ).rejects.toThrow("must use the format 'provider/model'")
   })
 })
 
@@ -158,6 +338,16 @@ describe("pre-execution review", () => {
 
     await executeBefore(hooks, "bash", { command: "date" })
 
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("treats the v2 shell tool name like bash", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "shell", { command: "date" })
+    await expect(executeBefore(hooks, "shell", { command: "sudo --version" })).rejects.toThrow(
+      "privilege escalation",
+    )
     expect(state.promptCalls).toBe(0)
   })
 
@@ -261,6 +451,102 @@ describe("pre-execution review", () => {
     },
   )
 
+  test("creates the reviewer session with the configured agent and model", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "printf test" })
+
+    expect(state.promptCalls).toBe(1)
+    expect(state.reviewerCreates[0]).toMatchObject({
+      parentID: "session",
+      agent: "auto-reviewer",
+      model: { id: "test-model", providerID: "openai" },
+    })
+    expect(String(state.reviewerCreates[0]?.title)).toContain("Auto review")
+  })
+
+  test("falls back to the reviewed session model when no reviewer model is configured", async () => {
+    const { hooks, state } = await makeHooks(
+      "ALLOW: model fallback fixture",
+      [],
+      "/workspace/project",
+      [],
+      ["planning the change"],
+      {},
+      { enabled: true },
+    )
+
+    await executeBefore(hooks, "bash", { command: "printf test" })
+
+    expect(state.reviewerCreates[0]).toMatchObject({
+      model: { id: "session-model", providerID: "session-provider" },
+    })
+  })
+
+  test("removes the reviewer session after a completed review", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "printf test" })
+
+    expect(state.removedSessions).toHaveLength(1)
+    expect(state.interruptedSessions).toHaveLength(0)
+  })
+
+  test("removes the reviewer session when the response is unclear", async () => {
+    const { hooks, state } = await makeHooks("Commentary before decision\nALLOW: unsafe response shape")
+
+    await expect(executeBefore(hooks, "bash", { command: "printf test" })).rejects.toThrow(
+      "Auto-reviewer unavailable",
+    )
+
+    // The reviewer completed (it produced a final message), so the session is
+    // idle and only removal is needed; interruption is reserved for reviews
+    // that never completed (v1 set completed before parsing as well).
+    expect(state.removedSessions).toHaveLength(1)
+    expect(state.interruptedSessions).toHaveLength(0)
+  })
+
+  test("interrupts and removes the reviewer session when the review never completes", async () => {
+    const { hooks, state } = await makeHooks()
+    state.hangReview = true
+
+    await expect(executeBefore(hooks, "bash", { command: "printf test" })).rejects.toThrow(
+      "Auto-reviewer unavailable",
+    )
+
+    expect(state.removedSessions).toHaveLength(1)
+    expect(state.interruptedSessions).toHaveLength(1)
+  })
+
+  test("recovers when the reviewer's first turn is a summary and the decision arrives on a later step", async () => {
+    const { hooks, state } = await makeHooks()
+    state.pendingTurns = [
+      "**Summary of work completed:**\n- Analyzed the proposed tool invocation: a bash call",
+      "ALLOW: harmless test command",
+    ]
+
+    await executeBefore(hooks, "bash", { command: "printf test" })
+
+    expect(state.promptCalls).toBe(1)
+    expect(state.removedSessions).toHaveLength(1)
+    expect(state.interruptedSessions).toHaveLength(0)
+  })
+
+  test("fails closed when the reviewer never produces a decision line across all steps", async () => {
+    const { hooks, state } = await makeHooks()
+    state.pendingTurns = [
+      "**Summary of work completed:**\n- Analyzed the proposed tool invocation",
+      "still summarizing the invocation",
+    ]
+
+    await expect(executeBefore(hooks, "bash", { command: "printf test" })).rejects.toThrow(
+      "Auto-reviewer unavailable; bash operation blocked: Reviewer response was unclear",
+    )
+
+    expect(state.removedSessions).toHaveLength(1)
+    expect(state.interruptedSessions).toHaveLength(0)
+  })
+
   test("reviews external reads instead of statically allowing them", async () => {
     const { hooks, state } = await makeHooks("ALLOW: explicitly authorized external read")
 
@@ -332,27 +618,30 @@ describe("pre-execution review", () => {
     }
   })
 
-  test.each(["read", "write", "lsp"])("reviews canonical external targets for %s", async (tool) => {
-    const base = await mkdtemp(join(tmpdir(), `auto-mode-${tool}-`))
-    const project = join(base, "project")
-    const external = join(base, "external")
-    await mkdir(project)
-    await mkdir(external)
-    await writeFile(join(external, "target.txt"), "safe test marker")
-    await symlink(external, join(project, "link"))
+  test.each(["read", "write", "lsp"])(
+    "reviews canonical external targets for %s",
+    async (tool) => {
+      const base = await mkdtemp(join(tmpdir(), `auto-mode-${tool}-`))
+      const project = join(base, "project")
+      const external = join(base, "external")
+      await mkdir(project)
+      await mkdir(external)
+      await writeFile(join(external, "target.txt"), "safe test marker")
+      await symlink(external, join(project, "link"))
 
-    try {
-      const { hooks, state } = await makeHooks("ALLOW: test inspects canonical path", [], project)
+      try {
+        const { hooks, state } = await makeHooks("ALLOW: test inspects canonical path", [], project)
 
-      await executeBefore(hooks, tool, { filePath: join(project, "link", "target.txt") })
+        await executeBefore(hooks, tool, { filePath: join(project, "link", "target.txt") })
 
-      expect(state.promptCalls).toBe(1)
-      expect(state.reviewerRequests[0]).toContain(join(external, "target.txt"))
-      expect(state.reviewerRequests[0]).toContain("canonical target is outside the project")
-    } finally {
-      await rm(base, { recursive: true, force: true })
-    }
-  })
+        expect(state.promptCalls).toBe(1)
+        expect(state.reviewerRequests[0]).toContain(join(external, "target.txt"))
+        expect(state.reviewerRequests[0]).toContain("canonical target is outside the project")
+      } finally {
+        await rm(base, { recursive: true, force: true })
+      }
+    },
+  )
 
   test("labels user messages as authorization context for external access", async () => {
     const authorization = "Read files in /outside/authorized-project to fix the plugin."
@@ -502,8 +791,8 @@ describe("pre-execution review", () => {
   ])("preserves raw URL encoding for %s authorization", async (tool, firstArgs, secondArgs) => {
     const { hooks, state } = await makeHooks()
 
-    await executeBefore(hooks, tool, firstArgs)
-    await executeBefore(hooks, tool, secondArgs)
+    await executeBefore(hooks, tool, firstArgs as Record<string, unknown>)
+    await executeBefore(hooks, tool, secondArgs as Record<string, unknown>)
 
     expect(state.promptCalls).toBe(2)
     expect(state.reviewerRequests[0]).not.toBe(state.reviewerRequests[1])
@@ -511,34 +800,22 @@ describe("pre-execution review", () => {
     expect(state.reviewerRequests[1]).toContain("https://example.test/path?q=+")
   })
 
-  test.each(["user", "assistant"])("redacts secrets from %s conversation context", async (role) => {
-    const marker = "SYNTHETIC_CONTEXT_SECRET_123456789"
-    const message = `OPENAI_API_KEY=${marker}`
-    const urlPassword = "&SYNTHETIC_URL_PASSWORD_123456789;()"
-    const url = `https://alice:${urlPassword}@example.test/repository`
-    const userMessages = role === "user" ? [`${message} ${url}`] : []
-    const assistantMessages = role === "assistant" ? [`${message} ${url}`] : []
-    const { hooks, state } = await makeHooks("ALLOW: safe fixture operation", userMessages, "/workspace/project", [], assistantMessages)
-
-    await executeBefore(hooks, "list_mcp_resources", { server: "remote" })
-
-    expect(state.reviewerRequests[0]).not.toContain(marker)
-    expect(state.reviewerRequests[0]).not.toContain(urlPassword)
-    expect(state.reviewerRequests[0]).toContain("https://example.test/repository")
-    expect(state.reviewerRequests[0]).toContain("OPENAI_API_KEY=[REDACTED]")
-  })
-
-  test.each(["AGENTS.md", "README.md"])("redacts secrets from %s project context", async (name) => {
-    const project = await mkdtemp(join(tmpdir(), "auto-mode-project-context-"))
-    const marker = "SYNTHETIC_PROJECT_SECRET_123456789"
-    const urlPassword = "&SYNTHETIC_PROJECT_URL_PASSWORD_123456789;()"
-    await writeFile(
-      join(project, name),
-      `OPENAI_API_KEY=${marker}\nhttps://alice:${urlPassword}@example.test/repository`,
-    )
-
-    try {
-      const { hooks, state } = await makeHooks("ALLOW: safe fixture operation", [], project)
+  test.each(["user", "assistant"])(
+    "redacts secrets from %s conversation context",
+    async (role) => {
+      const marker = "SYNTHETIC_CONTEXT_SECRET_123456789"
+      const message = `OPENAI_API_KEY=${marker}`
+      const urlPassword = "&SYNTHETIC_URL_PASSWORD_123456789;()"
+      const url = `https://alice:${urlPassword}@example.test/repository`
+      const userMessages = role === "user" ? [`${message} ${url}`] : []
+      const assistantMessages = role === "assistant" ? [`${message} ${url}`] : []
+      const { hooks, state } = await makeHooks(
+        "ALLOW: safe fixture operation",
+        userMessages,
+        "/workspace/project",
+        [],
+        assistantMessages,
+      )
 
       await executeBefore(hooks, "list_mcp_resources", { server: "remote" })
 
@@ -546,27 +823,67 @@ describe("pre-execution review", () => {
       expect(state.reviewerRequests[0]).not.toContain(urlPassword)
       expect(state.reviewerRequests[0]).toContain("https://example.test/repository")
       expect(state.reviewerRequests[0]).toContain("OPENAI_API_KEY=[REDACTED]")
+    },
+  )
+
+  test.each(["AGENTS.md", "README.md"])(
+    "redacts secrets from %s project context",
+    async (name) => {
+      const project = await mkdtemp(join(tmpdir(), "auto-mode-project-context-"))
+      const marker = "SYNTHETIC_PROJECT_SECRET_123456789"
+      const urlPassword = "&SYNTHETIC_PROJECT_URL_PASSWORD_123456789;()"
+      await writeFile(
+        join(project, name),
+        `OPENAI_API_KEY=${marker}\nhttps://alice:${urlPassword}@example.test/repository`,
+      )
+
+      try {
+        const { hooks, state } = await makeHooks("ALLOW: safe fixture operation", [], project)
+
+        await executeBefore(hooks, "list_mcp_resources", { server: "remote" })
+
+        expect(state.reviewerRequests[0]).not.toContain(marker)
+        expect(state.reviewerRequests[0]).not.toContain(urlPassword)
+        expect(state.reviewerRequests[0]).toContain("https://example.test/repository")
+        expect(state.reviewerRequests[0]).toContain("OPENAI_API_KEY=[REDACTED]")
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test("includes Git context from the workspace repository", async () => {
+    const project = await mkdtemp(join(tmpdir(), "auto-mode-git-"))
+    await git(project, ["init", "-q"])
+    await git(project, ["checkout", "-q", "-b", "auto-review-test"])
+
+    try {
+      const { hooks, state } = await makeHooks("ALLOW: git context fixture", [], project)
+
+      await executeBefore(hooks, "list_mcp_resources", { server: "remote" })
+
+      expect(state.reviewerRequests[0]).toContain("Branch: auto-review-test")
     } finally {
       await rm(project, { recursive: true, force: true })
     }
   })
 
   test("redacts URL credentials from Git context", async () => {
-    const urlPassword = "&SYNTHETIC_GIT_URL_PASSWORD_123456789;()"
-    const status = ` M https://alice:${urlPassword}@example.test/repository`
-    const { hooks, state } = await makeHooks(
-      "ALLOW: safe fixture operation",
-      [],
-      "/workspace/project",
-      [],
-      [],
-      ["main", status],
-    )
+    const project = await mkdtemp(join(tmpdir(), "auto-mode-git-secret-"))
+    const marker = "SYNTHETIC_GIT_TOKEN_1234567890123456789"
+    await git(project, ["init", "-q"])
+    await writeFile(join(project, `gho_${marker}.txt`), "safe test marker")
 
-    await executeBefore(hooks, "list_mcp_resources", { server: "remote" })
+    try {
+      const { hooks, state } = await makeHooks("ALLOW: git secret fixture", [], project)
 
-    expect(state.reviewerRequests[0]).not.toContain(urlPassword)
-    expect(state.reviewerRequests[0]).toContain("https://example.test/repository")
+      await executeBefore(hooks, "list_mcp_resources", { server: "remote" })
+
+      expect(state.reviewerRequests[0]).not.toContain(marker)
+      expect(state.reviewerRequests[0]).toContain("[REDACTED]")
+    } finally {
+      await rm(project, { recursive: true, force: true })
+    }
   })
 
   test("blocks URLs whose resource identity contains redacted secrets", async () => {
@@ -595,28 +912,34 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(0)
   })
 
-  test.each([";", "&&", "||", "|"])("preserves shell operator %s after a redacted URL", async (operator) => {
-    const { hooks, state } = await makeHooks()
+  test.each([";", "&&", "||", "|"])(
+    "preserves shell operator %s after a redacted URL",
+    async (operator) => {
+      const { hooks, state } = await makeHooks()
 
-    await executeBefore(hooks, "bash", { command: `curl https://example.test/path${operator}git push` })
+      await executeBefore(hooks, "bash", { command: `curl https://example.test/path${operator}git push` })
 
-    const encodedOperator = operator.replaceAll("&", "\\u0026")
-    expect(state.reviewerRequests[0]).toContain(`https://example.test/path${encodedOperator}git push`)
-  })
+      const encodedOperator = operator.replaceAll("&", "\\u0026")
+      expect(state.reviewerRequests[0]).toContain(`https://example.test/path${encodedOperator}git push`)
+    },
+  )
 
   test.each([
     "OPENAI_API_KEY=SYNTHETIC_PREFIXED_SECRET_123456789 command",
     "AWS_SECRET_ACCESS_KEY='SYNTHETIC PREFIXED SECRET 123456789' command",
     "command --github-token=SYNTHETIC_PREFIXED_SECRET_123456789",
-  ])("redacts prefixed secret assignment: %s", async (command) => {
-    const { hooks, state } = await makeHooks()
+  ])(
+    "redacts prefixed secret assignment: %s",
+    async (command) => {
+      const { hooks, state } = await makeHooks()
 
-    await expect(executeBefore(hooks, "bash", { command })).rejects.toThrow(
-      "cannot safely review incomplete bash arguments",
-    )
+      await expect(executeBefore(hooks, "bash", { command })).rejects.toThrow(
+        "cannot safely review incomplete bash arguments",
+      )
 
-    expect(state.promptCalls).toBe(0)
-  })
+      expect(state.promptCalls).toBe(0)
+    },
+  )
 
   test.each([
     "TOKEN=$(./malware) true",
@@ -641,23 +964,26 @@ describe("pre-execution review", () => {
     `curl -H "Authorization: Bearer $(./malware)" https://example.test`,
     `curl -H "X-API-Key: \`./malware\`" https://example.test`,
     `command --api-key="$(./malware)"`,
-  ])("hard-blocks substitution in another redacted secret value: %s", async (command) => {
-    const { hooks, state } = await makeHooks()
+  ])(
+    "hard-blocks substitution in another redacted secret value: %s",
+    async (command) => {
+      const { hooks, state } = await makeHooks()
 
-    await expect(executeBefore(hooks, "bash", { command })).rejects.toThrow(
-      "redacted secret value contains executable shell substitution",
-    )
+      await expect(executeBefore(hooks, "bash", { command })).rejects.toThrow(
+        "redacted secret value contains executable shell substitution",
+      )
 
-    expect(state.promptCalls).toBe(0)
-  })
+      expect(state.promptCalls).toBe(0)
+    },
+  )
 
   test("blocks opaque secret-looking URL query names", async () => {
     const marker = "OPAQUE_QUERY_NAME_SECRET_123456789"
     const { hooks, state } = await makeHooks()
 
-    await expect(executeBefore(hooks, "webfetch", { url: `https://example.test/path?${marker}=x` })).rejects.toThrow(
-      "cannot safely review incomplete webfetch arguments",
-    )
+    await expect(
+      executeBefore(hooks, "webfetch", { url: `https://example.test/path?${marker}=x` }),
+    ).rejects.toThrow("cannot safely review incomplete webfetch arguments")
 
     expect(state.promptCalls).toBe(0)
   })
@@ -665,9 +991,9 @@ describe("pre-execution review", () => {
   test("blocks oversized Bash operations before model review", async () => {
     const { hooks, state } = await makeHooks()
 
-    await expect(executeBefore(hooks, "bash", { command: `${"x".repeat(8_001)};git push` })).rejects.toThrow(
-      "cannot safely review incomplete bash arguments",
-    )
+    await expect(
+      executeBefore(hooks, "bash", { command: `${"x".repeat(8_001)};git push` }),
+    ).rejects.toThrow("cannot safely review incomplete bash arguments")
 
     expect(state.promptCalls).toBe(0)
   })
@@ -710,68 +1036,36 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(0)
   })
 
-  test.each(["token", "password", "apiKey"])("blocks opaque values in secret-named %s fields", async (key) => {
-    const marker = "opaque-value-123456789"
-    const { hooks, state } = await makeHooks()
+  test.each(["token", "password", "apiKey"])(
+    "blocks opaque values in secret-named %s fields",
+    async (key) => {
+      const marker = "opaque-value-123456789"
+      const { hooks, state } = await makeHooks()
 
-    await expect(executeBefore(hooks, "custom_remote_tool", { [key]: marker })).rejects.toThrow(
-      "cannot safely review incomplete custom_remote_tool arguments",
-    )
+      await expect(executeBefore(hooks, "custom_remote_tool", { [key]: marker })).rejects.toThrow(
+        "cannot safely review incomplete custom_remote_tool arguments",
+      )
 
-    expect(state.promptCalls).toBe(0)
-  })
+      expect(state.promptCalls).toBe(0)
+    },
+  )
 
   test.each([
     ["password", 123456],
     ["token", ["opaque", 123]],
     ["credentials", { value: "opaque-value" }],
-  ])("blocks structured values in secret-named %s fields", async (key, value) => {
-    const { hooks, state } = await makeHooks()
+  ])(
+    "blocks structured values in secret-named %s fields",
+    async (key, value) => {
+      const { hooks, state } = await makeHooks()
 
-    await expect(executeBefore(hooks, "custom_remote_tool", { [key]: value })).rejects.toThrow(
-      "cannot safely review incomplete custom_remote_tool arguments",
-    )
+      await expect(executeBefore(hooks, "custom_remote_tool", { [key]: value })).rejects.toThrow(
+        "cannot safely review incomplete custom_remote_tool arguments",
+      )
 
-    expect(state.promptCalls).toBe(0)
-  })
-
-  test("fails closed for incomplete permission.ask commands", async () => {
-    const { hooks, state } = await makeHooks()
-    const output = { status: "ask" }
-
-    await hooks["permission.ask"]?.(
-      {
-        type: "bash",
-        sessionID: "session",
-        callID: "call",
-        metadata: { command: "curl -H 'Authorization: Bearer opaque-value' https://example.test" },
-      } as never,
-      output as never,
-    )
-
-    expect(output.status).toBe("deny")
-    expect(state.promptCalls).toBe(0)
-  })
-
-  test("fails closed for incomplete permission events", async () => {
-    const { hooks, state } = await makeHooks()
-
-    await hooks.event?.({
-      event: {
-        type: "permission.asked",
-        properties: {
-          id: "permission",
-          sessionID: "session",
-          permission: "bash",
-          metadata: { command: "curl https://alice:opaque-value@example.test" },
-          tool: { messageID: "message", callID: "call" },
-        },
-      },
-    } as never)
-
-    expect(state.permissionResponses).toEqual(["reject"])
-    expect(state.promptCalls).toBe(0)
-  })
+      expect(state.promptCalls).toBe(0)
+    },
+  )
 
   test("redacts secrets from canonical path annotations", async () => {
     const base = await mkdtemp(join(tmpdir(), "auto-mode-secret-path-"))
@@ -838,47 +1132,53 @@ describe("pre-execution review", () => {
     }
   })
 
-  test.each(["-F", "-T"])("canonicalizes paths attached to arbitrary short option %s", async (option) => {
-    const base = await mkdtemp(join(tmpdir(), "auto-mode-generic-option-"))
-    const project = join(base, "project")
-    const external = join(base, "external")
-    await mkdir(project)
-    await mkdir(external)
-    await writeFile(join(external, "config"), "safe test marker")
-    await symlink(external, join(project, "link"))
+  test.each(["-F", "-T"])(
+    "canonicalizes paths attached to arbitrary short option %s",
+    async (option) => {
+      const base = await mkdtemp(join(tmpdir(), "auto-mode-generic-option-"))
+      const project = join(base, "project")
+      const external = join(base, "external")
+      await mkdir(project)
+      await mkdir(external)
+      await writeFile(join(external, "config"), "safe test marker")
+      await symlink(external, join(project, "link"))
 
-    try {
-      const { hooks, state } = await makeHooks("ALLOW: fixture option review", [], project)
+      try {
+        const { hooks, state } = await makeHooks("ALLOW: fixture option review", [], project)
 
-      await executeBefore(hooks, "bash", { command: `tool ${option}link/config` })
+        await executeBefore(hooks, "bash", { command: `tool ${option}link/config` })
 
-      expect(state.reviewerRequests[0]).toContain(join(external, "config"))
-      expect(state.reviewerRequests[0]).toContain("canonical target is outside the project")
-    } finally {
-      await rm(base, { recursive: true, force: true })
-    }
-  })
+        expect(state.reviewerRequests[0]).toContain(join(external, "config"))
+        expect(state.reviewerRequests[0]).toContain("canonical target is outside the project")
+      } finally {
+        await rm(base, { recursive: true, force: true })
+      }
+    },
+  )
 
-  test.each([">", ">>", "2>", "<", ">|", "<>", "&>", "&>>"])("canonicalizes attached shell redirection %s", async (redirect) => {
-    const base = await mkdtemp(join(tmpdir(), "auto-mode-redirection-"))
-    const project = join(base, "project")
-    const external = join(base, "external")
-    await mkdir(project)
-    await mkdir(external)
-    await writeFile(join(external, "target"), "safe test marker")
-    await symlink(external, join(project, "link"))
+  test.each([">", ">>", "2>", "<", ">|", "<>", "&>", "&>>"])(
+    "canonicalizes attached shell redirection %s",
+    async (redirect) => {
+      const base = await mkdtemp(join(tmpdir(), "auto-mode-redirection-"))
+      const project = join(base, "project")
+      const external = join(base, "external")
+      await mkdir(project)
+      await mkdir(external)
+      await writeFile(join(external, "target"), "safe test marker")
+      await symlink(external, join(project, "link"))
 
-    try {
-      const { hooks, state } = await makeHooks("ALLOW: fixture redirection review", [], project)
+      try {
+        const { hooks, state } = await makeHooks("ALLOW: fixture redirection review", [], project)
 
-      await executeBefore(hooks, "bash", { command: `printf x ${redirect}link/target` })
+        await executeBefore(hooks, "bash", { command: `printf x ${redirect}link/target` })
 
-      expect(state.reviewerRequests[0]).toContain(join(external, "target"))
-      expect(state.reviewerRequests[0]).toContain("canonical target is outside the project")
-    } finally {
-      await rm(base, { recursive: true, force: true })
-    }
-  })
+        expect(state.reviewerRequests[0]).toContain(join(external, "target"))
+        expect(state.reviewerRequests[0]).toContain("canonical target is outside the project")
+      } finally {
+        await rm(base, { recursive: true, force: true })
+      }
+    },
+  )
 
   test("canonicalizes a project-relative executable token", async () => {
     const base = await mkdtemp(join(tmpdir(), "auto-mode-executable-"))
@@ -972,6 +1272,51 @@ describe("pre-execution review", () => {
       }
     },
   )
+
+  test("sends plain variable expansion to the reviewer with an env-expansion behavior", async () => {
+    const { hooks, state } = await makeHooks("ALLOW: printing the temp directory")
+
+    await executeBefore(hooks, "bash", { command: 'echo "$TMPDIR"' })
+
+    expect(state.promptCalls).toBe(1)
+    expect(state.reviewerRequests[0]).toContain("env-expansion: expands TMPDIR (value not visible to the reviewer)")
+  })
+
+  test("labels secret-looking variable expansions for the reviewer", async () => {
+    const { hooks, state } = await makeHooks("BLOCK: secret expansion")
+
+    await expect(executeBefore(hooks, "bash", { command: 'echo "$GH_TOKEN"' })).rejects.toThrow(
+      "Auto-reviewer blocked bash: secret expansion",
+    )
+
+    expect(state.promptCalls).toBe(1)
+    expect(state.reviewerRequests[0]).toContain("secret-expansion: expands a secret-looking environment variable")
+  })
+
+  test("sends recursive deletion with an unknown target to the reviewer", async () => {
+    const { hooks, state } = await makeHooks("BLOCK: unknown target")
+
+    await expect(executeBefore(hooks, "bash", { command: "rm -rf $TARGET" })).rejects.toThrow(
+      "Auto-reviewer blocked bash: unknown target",
+    )
+
+    expect(state.promptCalls).toBe(1)
+    expect(state.reviewerRequests[0]).toContain("recursive-delete: recursively deletes files or directories")
+    expect(state.reviewerRequests[0]).toContain("env-expansion: expands TARGET (value not visible to the reviewer)")
+  })
+
+  test("still hard-blocks backticks and process substitution", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await expect(executeBefore(hooks, "bash", { command: "echo `id`" })).rejects.toThrow(
+      "dynamic shell expansion or grouping cannot be safely reviewed",
+    )
+    await expect(executeBefore(hooks, "bash", { command: "diff <(ls a) <(ls b)" })).rejects.toThrow(
+      "dynamic shell expansion or grouping cannot be safely reviewed",
+    )
+
+    expect(state.promptCalls).toBe(0)
+  })
 
   test("redacts secrets from the effective Bash workdir", async () => {
     const base = await mkdtemp(join(tmpdir(), "auto-mode-secret-workdir-"))
@@ -1072,29 +1417,32 @@ describe("pre-execution review", () => {
     ["Update", "*** Update File:   link/target.txt\n@@\n-before\n+after"],
     ["Delete", "*** Delete File:   link/target.txt"],
     ["Move", "*** Update File: source.txt\n*** Move to:   link/moved.txt\n@@\n-before\n+after"],
-  ])("does not statically permit whitespace-padded external %s paths", async (_operation, directive) => {
-    const base = await mkdtemp(join(tmpdir(), "auto-mode-padded-external-patch-"))
-    const project = join(base, "project")
-    const external = join(base, "external")
-    await mkdir(project)
-    await mkdir(external)
-    await writeFile(join(project, "source.txt"), "before")
-    await writeFile(join(external, "target.txt"), "before")
-    await symlink(external, join(project, "link"))
+  ])(
+    "does not statically permit whitespace-padded external %s paths",
+    async (_operation, directive) => {
+      const base = await mkdtemp(join(tmpdir(), "auto-mode-padded-external-patch-"))
+      const project = join(base, "project")
+      const external = join(base, "external")
+      await mkdir(project)
+      await mkdir(external)
+      await writeFile(join(project, "source.txt"), "before")
+      await writeFile(join(external, "target.txt"), "before")
+      await symlink(external, join(project, "link"))
 
-    try {
-      const { hooks, state } = await makeHooks("ALLOW: external patch authorized for test", [], project)
+      try {
+        const { hooks, state } = await makeHooks("ALLOW: external patch authorized for test", [], project)
 
-      await executeBefore(hooks, "apply_patch", {
-        patchText: `*** Begin Patch\n${directive}\n*** End Patch`,
-      })
+        await executeBefore(hooks, "apply_patch", {
+          patchText: `*** Begin Patch\n${directive}\n*** End Patch`,
+        })
 
-      expect(state.promptCalls).toBe(1)
-      expect(state.reviewerRequests[0]).toContain(external)
-    } finally {
-      await rm(base, { recursive: true, force: true })
-    }
-  })
+        expect(state.promptCalls).toBe(1)
+        expect(state.reviewerRequests[0]).toContain(external)
+      } finally {
+        await rm(base, { recursive: true, force: true })
+      }
+    },
+  )
 
   test("blocks apply_patch when its complete path projection is oversized", async () => {
     const { hooks, state } = await makeHooks()
@@ -1108,23 +1456,394 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(0)
   })
 
-  test.each(["AGENTS.md", "README.md"])("does not follow a symlinked %s project document", async (name) => {
-    const base = await mkdtemp(join(tmpdir(), "auto-mode-project-doc-"))
-    const project = join(base, "project")
-    const external = join(base, "external.txt")
-    const marker = `SYNTHETIC_${name}_SECRET`
-    await mkdir(project)
-    await writeFile(external, marker)
-    await symlink(external, join(project, name))
+  test.each(["AGENTS.md", "README.md"])(
+    "does not follow a symlinked %s project document",
+    async (name) => {
+      const base = await mkdtemp(join(tmpdir(), "auto-mode-project-doc-"))
+      const project = join(base, "project")
+      const external = join(base, "external.txt")
+      const marker = `SYNTHETIC_${name}_SECRET`
+      await mkdir(project)
+      await writeFile(external, marker)
+      await symlink(external, join(project, name))
+
+      try {
+        const { hooks, state } = await makeHooks("ALLOW: safe fixture operation", [], project)
+
+        await executeBefore(hooks, "read", { filePath: join(project, "ordinary.txt") })
+
+        expect(state.reviewerRequests[0]).not.toContain(marker)
+      } finally {
+        await rm(base, { recursive: true, force: true })
+      }
+    },
+  )
+})
+
+describe("file-content tools", () => {
+  test("reviews small write content in full without an omission marker", async () => {
+    const { hooks, state } = await makeHooks("ALLOW: writing a small project file")
+
+    await executeBefore(hooks, "write", { filePath: "/workspace/project/note.txt", content: "hello world" })
+
+    expect(state.promptCalls).toBe(1)
+    expect(state.reviewerRequests[0]).toContain("hello world")
+    expect(state.reviewerRequests[0]).not.toContain("more characters omitted")
+  })
+
+  test("reviews large write content with a bounded preview instead of blocking", async () => {
+    const body = "line of code\n".repeat(400) // 5,200 characters
+    const { hooks, state } = await makeHooks("ALLOW: writing a project source file")
+
+    await executeBefore(hooks, "write", { filePath: "/workspace/project/src/big.ts", content: body })
+
+    expect(state.promptCalls).toBe(1)
+    const request = state.reviewerRequests[0]
+    expect(request).toContain("line of code")
+    expect(request).toContain("more characters omitted")
+    expect(request).toContain("\\\"contentChars\\\":5200")
+  })
+
+  test("reviews large edit strings with bounded previews", async () => {
+    const oldString = `old-${"x".repeat(4_495)}` // 4,500 characters
+    const newString = `new-${"y".repeat(4_195)}` // 4,200 characters
+    const { hooks, state } = await makeHooks("ALLOW: editing a project source file")
+
+    await executeBefore(hooks, "edit", { filePath: "/workspace/project/src/app.ts", oldString, newString })
+
+    expect(state.promptCalls).toBe(1)
+    const request = state.reviewerRequests[0]
+    expect(request).toContain("old-xxxx")
+    expect(request).toContain("new-yyyy")
+    expect(request).toContain("more characters omitted")
+  })
+
+  test("blocks write content that contains a secret-looking assignment", async () => {
+    const marker = "SYNTHETIC_WRITE_SECRET_123456789"
+    const { hooks, state } = await makeHooks()
+
+    await expect(
+      executeBefore(hooks, "write", {
+        filePath: "/workspace/project/notes.txt",
+        content: `OPENAI_API_KEY=${marker}`,
+      }),
+    ).rejects.toThrow("cannot safely review incomplete write arguments")
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("blocks edit content that contains a token-shaped value", async () => {
+    const marker = "gho_syntheticedit12345678901234567890"
+    const { hooks, state } = await makeHooks()
+
+    await expect(
+      executeBefore(hooks, "edit", {
+        filePath: "/workspace/project/src/app.ts",
+        oldString: "placeholder",
+        newString: `const token = "${marker}"`,
+      }),
+    ).rejects.toThrow("cannot safely review incomplete edit arguments")
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("still sends external write targets to the reviewer with path behavior", async () => {
+    const { hooks, state } = await makeHooks("ALLOW: externally authorized write")
+
+    await executeBefore(hooks, "write", { filePath: "/outside/project/note.txt", content: "hello" })
+
+    expect(state.promptCalls).toBe(1)
+    expect(state.reviewerRequests[0]).toContain("canonical target is outside the project")
+    expect(state.reviewerRequests[0]).toContain("/outside/project/note.txt")
+  })
+})
+
+describe("v2 tool names and fields", () => {
+  test("reviews a v2 write (path field) with large content instead of blocking", async () => {
+    const body = "line of code\n".repeat(400) // 5,200 characters
+    const { hooks, state } = await makeHooks("ALLOW: writing a project source file")
+
+    await executeBefore(hooks, "write", { path: "/workspace/project/src/big.ts", content: body })
+
+    expect(state.promptCalls).toBe(1)
+    const request = state.reviewerRequests[0]
+    expect(request).toContain("line of code")
+    expect(request).toContain("more characters omitted")
+    expect(request).toContain("/workspace/project/src/big.ts")
+  })
+
+  test("reviews a v2 edit (path field) with bounded previews", async () => {
+    const oldString = `old-${"x".repeat(4_495)}` // 4,500 characters
+    const newString = `new-${"y".repeat(4_195)}` // 4,200 characters
+    const { hooks, state } = await makeHooks("ALLOW: editing a project source file")
+
+    await executeBefore(hooks, "edit", { path: "/workspace/project/src/app.ts", oldString, newString })
+
+    expect(state.promptCalls).toBe(1)
+    const request = state.reviewerRequests[0]
+    expect(request).toContain("old-xxxx")
+    expect(request).toContain("new-yyyy")
+    expect(request).toContain("more characters omitted")
+    expect(request).toContain("/workspace/project/src/app.ts")
+  })
+
+  test("statically permits a v2 patch (renamed apply_patch) inside the project", async () => {
+    const project = await mkdtemp(join(tmpdir(), "auto-mode-v2-patch-"))
+    await writeFile(join(project, "source.txt"), "before")
 
     try {
-      const { hooks, state } = await makeHooks("ALLOW: safe fixture operation", [], project)
+      const { hooks, state } = await makeHooks("BLOCK: reviewer must not be reached", [], project)
 
-      await executeBefore(hooks, "read", { filePath: join(project, "ordinary.txt") })
+      await executeBefore(hooks, "patch", {
+        patchText: "*** Begin Patch\n*** Update File: source.txt\n@@\n-before\n+after\n*** End Patch",
+      })
 
-      expect(state.reviewerRequests[0]).not.toContain(marker)
+      expect(state.promptCalls).toBe(0)
+    } finally {
+      await rm(project, { recursive: true, force: true })
+    }
+  })
+
+  test("reviews a v2 patch whose move destination escapes the project", async () => {
+    const base = await mkdtemp(join(tmpdir(), "auto-mode-v2-patch-ext-"))
+    const project = join(base, "project")
+    const external = join(base, "external")
+    await mkdir(project)
+    await mkdir(external)
+    await writeFile(join(project, "source.txt"), "safe test marker")
+    await symlink(external, join(project, "link"))
+
+    try {
+      const { hooks, state } = await makeHooks("ALLOW: external patch authorized", [], project)
+
+      await executeBefore(hooks, "patch", {
+        patchText: "*** Begin Patch\n*** Update File: source.txt\n*** Move to: link/moved.txt\n*** End Patch",
+      })
+
+      expect(state.promptCalls).toBe(1)
+      expect(state.reviewerRequests[0]).toContain("canonical target is outside the project")
     } finally {
       await rm(base, { recursive: true, force: true })
     }
+  })
+
+  test("blocks a v2 subagent call whose prompt is opaque to the reviewer", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await expect(
+      executeBefore(hooks, "subagent", {
+        agent: "explore",
+        description: "Find the config loader",
+        prompt: "TOP_SECRET_SENTINEL",
+      }),
+    ).rejects.toThrow("cannot safely review incomplete subagent arguments")
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("reviews a read of a macOS /private/var temp path without a secret false positive", async () => {
+    const { hooks, state } = await makeHooks("ALLOW: temp file inspection")
+
+    await executeBefore(hooks, "read", { path: "/private/var/folders/_c/y0hkwq4n0y3dswtvbc9f9szc0000gn/T/opencode/x.txt" })
+
+    expect(state.promptCalls).toBe(1)
+    expect(state.reviewerRequests[0]).not.toContain("must be blocked")
+  })
+
+  test("still blocks a read whose value matches a secret pattern outside path context", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await expect(
+      executeBefore(hooks, "read", { path: "/workspace/project/keys/private_key.pem" }),
+    ).rejects.toThrow("cannot safely review incomplete read arguments")
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("explains why an incomplete shell invocation is blocked", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await expect(
+      executeBefore(hooks, "shell", { command: "curl -H \"Authorization: Bearer abcdef1234567890\" https://example.com/api" }),
+    ).rejects.toThrow("value that had to be redacted")
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("explains when a shell command exceeds the length bound", async () => {
+    const { hooks, state } = await makeHooks()
+    const command = `echo ${"a".repeat(9_000)}`
+
+    await expect(executeBefore(hooks, "shell", { command })).rejects.toThrow("command exceeds 8000 characters")
+
+    expect(state.promptCalls).toBe(0)
+  })
+})
+
+describe("permission evaluation hook", () => {
+  test("fails closed for incomplete permission evaluations", async () => {
+    const { hooks, state } = await makeHooks()
+    const event = {
+      sessionID: "session",
+      action: "shell",
+      resources: ["/workspace/project"],
+      metadata: { command: "curl -H 'Authorization: Bearer opaque-value' https://example.test" },
+      effect: "ask",
+    }
+
+    await hooks.permissionHooks["evaluate"]?.(event)
+
+    expect(event.effect).toBe("deny")
+    expect(event.message).toContain("incomplete permission request")
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("allows statically safe permission evaluations", async () => {
+    const { hooks } = await makeHooks()
+    const event = {
+      sessionID: "session",
+      action: "bash",
+      resources: ["/workspace/project"],
+      metadata: { command: "date" },
+      effect: "ask",
+    }
+
+    await hooks.permissionHooks["evaluate"]?.(event)
+
+    expect(event.effect).toBe("allow")
+  })
+
+  test("routes unsafe permission evaluations through the reviewer", async () => {
+    const { hooks, state } = await makeHooks("BLOCK: reviewer denies the fixture command")
+    const event = {
+      sessionID: "session",
+      action: "shell",
+      resources: ["/workspace/project"],
+      metadata: { command: "printf test" },
+      effect: "ask",
+    }
+
+    await hooks.permissionHooks["evaluate"]?.(event)
+
+    expect(event.effect).toBe("deny")
+    expect(event.message).toContain("fixture command")
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("denies and reports when the reviewer fails", async () => {
+    const { hooks } = await makeHooks("Commentary before decision\nALLOW: unsafe response shape")
+    const event = {
+      sessionID: "session",
+      action: "bash",
+      resources: ["/workspace/project"],
+      metadata: { command: "printf test" },
+      effect: "ask",
+    }
+
+    await hooks.permissionHooks["evaluate"]?.(event)
+
+    expect(event.effect).toBe("deny")
+    expect(event.message).toContain("Auto-reviewer unavailable")
+  })
+
+  test("ignores non-shell permission actions", async () => {
+    const { hooks, state } = await makeHooks()
+    const event = {
+      sessionID: "session",
+      action: "edit",
+      resources: ["/workspace/project"],
+      metadata: { command: "printf test" },
+      effect: "ask",
+    }
+
+    await hooks.permissionHooks["evaluate"]?.(event)
+
+    expect(event.effect).toBe("ask")
+    expect(state.promptCalls).toBe(0)
+  })
+})
+
+describe("permission events", () => {
+  test("fails closed for incomplete permission events", async () => {
+    const { hooks, state } = await makeHooks()
+
+    hooks.pushEvent({
+      type: "permission.asked",
+      data: {
+        id: "permission",
+        sessionID: "session",
+        action: "bash",
+        resources: [],
+        metadata: { command: "curl https://alice:opaque-value@example.test" },
+        source: { type: "tool", messageID: "message", id: "call" },
+      },
+    })
+
+    await waitFor(() => state.replies.length === 1)
+    expect(state.replies[0]).toEqual({ sessionID: "session", requestID: "permission", decision: "reject" })
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("replies once for statically safe permission events", async () => {
+    const { hooks, state } = await makeHooks()
+
+    hooks.pushEvent({ type: "session.idle", data: {} })
+    hooks.pushEvent({
+      type: "permission.asked",
+      data: {
+        id: "safe-permission",
+        sessionID: "session",
+        action: "shell",
+        resources: [],
+        metadata: { command: "git status" },
+      },
+    })
+
+    await waitFor(() => state.replies.length === 1)
+    expect(state.replies[0]).toEqual({ sessionID: "session", requestID: "safe-permission", decision: "once" })
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("replies reject when the reviewer fails on a permission event", async () => {
+    const { hooks, state } = await makeHooks("Commentary before decision\nALLOW: unsafe response shape")
+
+    hooks.pushEvent({
+      type: "permission.asked",
+      data: {
+        id: "flaky-permission",
+        sessionID: "session",
+        action: "bash",
+        resources: [],
+        metadata: { command: "printf test" },
+      },
+    })
+
+    await waitFor(() => state.replies.length === 1)
+    expect(state.replies[0]).toEqual({ sessionID: "session", requestID: "flaky-permission", decision: "reject" })
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("replies once for reviewer-approved permission events", async () => {
+    const { hooks, state } = await makeHooks("ALLOW: event fixture approved")
+
+    hooks.pushEvent({
+      type: "permission.asked",
+      data: {
+        id: "reviewed-permission",
+        sessionID: "session",
+        action: "shell",
+        resources: [],
+        metadata: { command: "printf test" },
+        source: { type: "tool", messageID: "message", id: "call" },
+      },
+    })
+
+    await waitFor(() => state.replies.length === 1)
+    expect(state.replies[0]).toEqual({
+      sessionID: "session",
+      requestID: "reviewed-permission",
+      decision: "once",
+    })
+    expect(state.promptCalls).toBe(1)
   })
 })
